@@ -556,6 +556,14 @@ if [ -n "$KOPT_root" ]; then
 	fi
 
 	eend $?
+
+	## add support for usr on seperate partition
+	if [ -f "${sysroot}/etc/fstab" ]; then
+    	grep '/usr' "${sysroot}/etc/fstab" | while read dev mnt fs MNTOPTS chk; do
+        	 mount -t $fs -o $MNTOPTS $dev ${sysroot}$mnt 
+    	done
+	fi
+	
 	cat /proc/mounts | while read DEV DIR TYPE OPTS ; do
 		if [ "$DIR" != "/" -a "$DIR" != "$sysroot" -a -d "$DIR" ]; then
 			mkdir -p $sysroot/$DIR
