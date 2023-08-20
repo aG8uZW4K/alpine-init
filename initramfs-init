@@ -1,28 +1,28 @@
 #!/bin/sh
 
 # this is the init script version
-VERSION=3.6.0-r0
+VERSION=3.8.1-r0
 SINGLEMODE=no
-sysroot=/sysroot
+sysroot="$ROOT"/sysroot
 splashfile=/.splash.ctrl
-repofile=/tmp/repositories
+repofile="$ROOT"/tmp/repositories
 
 # some helpers
 ebegin() {
 	last_emsg="$*"
-	echo "$last_emsg..." > /dev/kmsg
+	echo "$last_emsg..." > "$ROOT"/dev/kmsg
 	[ "$KOPT_quiet" = yes ] && return 0
 	echo -n " * $last_emsg: "
 }
 eend() {
 	local msg
 	if [ "$1" = 0 ] || [ $# -lt 1 ] ; then
-		echo "$last_emsg: ok." > /dev/kmsg
+		echo "$last_emsg: ok." > "$ROOT"/dev/kmsg
 		[ "$KOPT_quiet" = yes ] && return 0
 		echo "ok."
 	else
 		shift
-		echo "$last_emsg: failed. $*" > /dev/kmsg
+		echo "$last_emsg: failed. $*" > "$ROOT"/dev/kmsg
 		if [ "$KOPT_quiet" = "yes" ]; then
 			echo -n "$last_emsg "
 		fi
@@ -62,30 +62,28 @@ unpack_apkovl() {
 	return 1
 }
 
-# find mount dir for given device in an fstab
-# returns global MNTOPTS
-find_mnt() {
+# find mount dir and mount opts for given device in an fstab
+get_fstab_mount_info() {
 	local search_dev="$1"
 	local fstab="$2"
+	local mntopts=
 	case "$search_dev" in
 	UUID*|LABEL*) search_dev=$(findfs "$search_dev");;
 	esac
-	MNTOPTS=
 	[ -r "$fstab" ] || return 1
 	local search_maj_min=$(stat -L -c '%t,%T' $search_dev)
-	while read dev mnt fs MNTOPTS chk; do
+	while read dev mnt fs mntopts chk; do
 		case "$dev" in
 		UUID*|LABEL*) dev=$(findfs "$dev");;
 		esac
-		if [ -b "$dev" ]; then
+		if [ -b "$dev" ] || [ -n "$ROOT" ]; then
 			local maj_min=$(stat -L -c '%t,%T' $dev)
 			if [ "$maj_min" = "$search_maj_min" ]; then
-				echo "$mnt"
+				echo "$mnt $mntopts"
 				return
 			fi
 		fi
 	done < $fstab
-	MNTOPTS=
 }
 
 #  add a boot service to $sysroot
@@ -96,23 +94,39 @@ rc_add() {
 
 # Recursively resolve tty aliases like console or tty0
 list_console_devices() {
-	if ! [ -e /sys/class/tty/$1/active ]; then
+	if ! [ -e "$ROOT"/sys/class/tty/$1/active ]; then
 		echo $1
 		return
 	fi
 
-	for dev in $(cat /sys/class/tty/$1/active); do
+	for dev in $(cat "$ROOT"/sys/class/tty/$1/active); do
 		list_console_devices $dev
 	done
 }
 
-setup_inittab_console(){
+detect_serial_consoles() {
+	local n=$(awk '$7 ~ /CTS/ || $7 ~ /DSR/ { print $1 }' "$ROOT"/proc/tty/driver/serial 2>/dev/null)
+	if [ -n "$n" ]; then
+		echo ttyS${n%:}
+	fi
+	for i in "$ROOT"/sys/class/tty/*; do
+		if [ -e "$i"/device ]; then
+			echo ${i##*/}
+		fi
+	done
+}
+
+setup_inittab_console() {
 	term=vt100
 	# Inquire the kernel for list of console= devices
-	consoles="$(for c in console $KOPT_consoles; do list_console_devices $c; done)"
+	consoles="$(for c in console $KOPT_consoles $(detect_serial_consoles); do list_console_devices $c; done)"
 	for tty in $consoles; do
+		# ignore tty devices that gives I/O error
+		if ! stty -g -F /dev/$tty >/dev/null 2>/dev/null; then
+			continue
+		fi
 		# do nothing if inittab already have the tty set up
-		if ! grep -q "^$tty:" $sysroot/etc/inittab; then
+		if ! grep -q "^$tty:" $sysroot/etc/inittab 2>/dev/null; then
 			echo "# enable login on alternative console" \
 				>> $sysroot/etc/inittab
 			# Baudrate of 0 keeps settings from kernel
@@ -130,12 +144,12 @@ setup_inittab_console(){
 ip_choose_if() {
 	if [ -n "$KOPT_BOOTIF" ]; then
 		mac=$(printf "%s\n" "$KOPT_BOOTIF"|sed 's/^01-//;s/-/:/g')
-		dev=$(grep -l $mac /sys/class/net/*/address|head -n 1)
+		dev=$(grep -l $mac "$ROOT"/sys/class/net/*/address|head -n 1)
 		dev=${dev%/*}
 		[ -n "$dev" ] && echo "${dev##*/}" && return
 	fi
-	for x in /sys/class/net/eth*; do
-		if grep -iq up $x/operstate;then
+	for x in "$ROOT"/sys/class/net/eth*; do
+		if grep -iq up $x/operstate 2>/dev/null;then
 			[ -e "$x" ] && echo ${x##*/} && return
 		fi
 	done
@@ -190,13 +204,13 @@ configure_ip() {
 
 	if [ "$autoconf" = "dhcp" ]; then
 		# automatic configuration
-		if [ ! -e /usr/share/udhcpc/default.script ]; then
+		if [ ! -e "$ROOT"/usr/share/udhcpc/default.script ]; then
 			echo "ERROR: DHCP requested but not present in initrd"
 			return 1
 		fi
 		ebegin "Obtaining IP via DHCP ($device)"
-		ifconfig "$device" 0.0.0.0
-		udhcpc -i "$device" -f -q
+		$MOCK ifconfig "$device" 0.0.0.0
+		$MOCK udhcpc -i "$device" -f -q
 		eend $?
 	else
 		# manual configuration
@@ -216,28 +230,33 @@ configure_ip() {
 	MAC_ADDRESS=$(cat /sys/class/net/$device/address)
 }
 
-# relocate mountpoint according given fstab
-relocate_mount() {
+# relocate mountpoint according given fstab and set mount options
+remount_fstab_entry() {
 	local fstab="${1}"
 	local dir=
-	if ! [ -e $repofile ]; then
+	if ! [ -e "$repofile" ]; then
 		return
 	fi
-	while read dir; do
+	echo "$ovl" | cat - "$repofile" | while read dir; do
 		# skip http(s)/ftp repos for netboot
-		if ! [ -d "$dir" ]; then
+		if [ -z "$dir" ] || ! [ -d "$ROOT/$dir" -o -f "$ROOT/$dir" ]; then
 			continue
 		fi
 		local dev=$(df -P "$dir" | tail -1 | awk '{print $1}')
-		local mnt=$(find_mnt $dev $fstab)
+		local mntinfo="$(get_fstab_mount_info "$dev" "$fstab")"
+		local mnt="${mntinfo% *}"
+		local mntopts="${mntinfo#* }"
 		if [ -n "$mnt" ]; then
-			local oldmnt=$(awk -v d=$dev '$1==d {print $2}' /proc/mounts)
+			local oldmnt=$(awk -v d=$ROOT$dev '$1==d {print $2}' "$ROOT"/proc/mounts 2>/dev/null)
 			if [ "$oldmnt" != "$mnt" ]; then
 				mkdir -p "$mnt"
-				mount -o move "$oldmnt" "$mnt"
+				$MOCK mount -o move "$oldmnt" "$mnt"
+			fi
+			if [ -n "$mntopts" ]; then
+				$MOCK mount -o remount,"$mntopts" "$mnt"
 			fi
 		fi
-	done < $repofile
+	done
 }
 
 # find the dirs under ALPINE_MNT that are boot repositories
@@ -306,12 +325,21 @@ prepare_zfs_root() {
 	fi
 }
 
-/bin/busybox mkdir -p /usr/bin /usr/sbin /proc /sys /dev $sysroot \
-	/media/cdrom /media/usb /tmp /run/cryptsetup
+/bin/busybox mkdir -p "$ROOT"/usr/bin \
+	"$ROOT"/usr/sbin \
+	"$ROOT"/proc \
+	"$ROOT"/sys \
+	"$ROOT"/dev \
+	"$sysroot" \
+	"$ROOT"/media/cdrom \
+	"$ROOT"/media/usb \
+	"$ROOT"/tmp \
+	"$ROOT"/etc \
+	"$ROOT"/run/cryptsetup
 
 # Spread out busybox symlinks and make them available without full path
 /bin/busybox --install -s
-export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Make sure /dev/null is a device node. If /dev/null does not exist yet, the command
 # mounting the devtmpfs will create it implicitly as an file with the "2>" redirection.
@@ -319,35 +347,35 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 # error message.
 [ -c /dev/null ] || mknod -m 666 /dev/null c 1 3
 
-mount -t sysfs -o noexec,nosuid,nodev sysfs /sys
-mount -t devtmpfs -o exec,nosuid,mode=0755,size=2M devtmpfs /dev 2>/dev/null \
-	|| mount -t tmpfs -o exec,nosuid,mode=0755,size=2M tmpfs /dev
+$MOCK mount -t sysfs -o noexec,nosuid,nodev sysfs /sys
+$MOCK mount -t devtmpfs -o exec,nosuid,mode=0755,size=2M devtmpfs /dev 2>/dev/null \
+	|| $MOCK mount -t tmpfs -o exec,nosuid,mode=0755,size=2M tmpfs /dev
 
 # Make sure /dev/kmsg is a device node. Writing to /dev/kmsg allows the use of the
 # earlyprintk kernel option to monitor early init progress. As above, the -c check
 # prevents an error if the device node has already been seeded.
 [ -c /dev/kmsg ] || mknod -m 660 /dev/kmsg c 1 11
 
-mount -t proc -o noexec,nosuid,nodev proc /proc
+$MOCK mount -t proc -o noexec,nosuid,nodev proc /proc
 # pty device nodes (later system will need it)
 [ -c /dev/ptmx ] || mknod -m 666 /dev/ptmx c 5 2
 [ -d /dev/pts ] || mkdir -m 755 /dev/pts
-mount -t devpts -o gid=5,mode=0620,noexec,nosuid devpts /dev/pts
+$MOCK mount -t devpts -o gid=5,mode=0620,noexec,nosuid devpts /dev/pts
 
 # shared memory area (later system will need it)
 [ -d /dev/shm ] || mkdir /dev/shm
-mount -t tmpfs -o nodev,nosuid,noexec shm /dev/shm
+$MOCK mount -t tmpfs -o nodev,nosuid,noexec shm /dev/shm
 
 
 # read the kernel options. we need surve things like:
 #  acpi_osi="!Windows 2006" xen-pciback.hide=(01:00.0)
-set -- $(cat /proc/cmdline)
+set -- $(cat "$ROOT"/proc/cmdline)
 
 myopts="alpine_dev autodetect autoraid chart cryptroot cryptdm cryptheader cryptoffset
 	cryptdiscards cryptkey debug_init dma init init_args keep_apk_new modules ovl_dev
 	pkgs quiet root_size root usbdelay ip alpine_repo apkovl alpine_start splash
 	blacklist overlaytmpfs overlaytmpfsflags rootfstype rootflags nbd resume s390x_net
-	dasd ssh_key BOOTIF zfcp"
+	dasd ssh_key BOOTIF zfcp uevent_buf_size"
 
 for opt; do
 	case "$opt" in
@@ -358,6 +386,7 @@ for opt; do
 	console=*)
 		opt="${opt#*=}"
 		KOPT_consoles="${opt%%,*} $KOPT_consoles"
+		switch_root_opts="-c /dev/${opt%%,*}"
 		continue
 		;;
 	esac
@@ -371,7 +400,7 @@ for opt; do
 	done
 done
 
-echo "Alpine Init $VERSION" > /dev/kmsg
+echo "Alpine Init $VERSION" > "$ROOT"/dev/kmsg
 [ "$KOPT_quiet" = yes ] || echo "Alpine Init $VERSION"
 
 # enable debugging if requested
@@ -381,7 +410,7 @@ echo "Alpine Init $VERSION" > /dev/kmsg
 : ${KOPT_init:=/sbin/init}
 
 # pick first keymap if found
-for map in /etc/keymap/*; do
+for map in "$ROOT"/etc/keymap/*; do
 	if [ -f "$map" ]; then
 		ebegin "Setting keymap ${map##*/}"
 		zcat "$map" | loadkmap
@@ -407,9 +436,12 @@ ALPINE_REPO=${KOPT_alpine_repo}
 [ "$KOPT_quiet" = yes ] && dmesg -n 1
 
 # optional blacklist
-for i in ${KOPT_blacklist//,/ }; do
-	echo "blacklist $i" >> /etc/modprobe.d/boot-opt-blacklist.conf
-done
+if [ -n "$KOPT_blacklist" ]; then
+	mkdir -p "$ROOT"/etc/modprobe.d
+	for i in $(echo "$KOPT_blacklist" | tr ',' ' '); do
+		echo "blacklist $i" >> "$ROOT"/etc/modprobe.d/boot-opt-blacklist.conf
+	done
+fi
 
 # determine if we are going to need networking
 if [ -n "$KOPT_ip" ] || [ -n "$KOPT_nbd" ] || \
@@ -457,8 +489,8 @@ fi
 # load available drivers to get access to modloop media
 ebegin "Loading boot drivers"
 
-modprobe -a $(echo "$KOPT_modules $rootfstype" | tr ',' ' ' ) loop squashfs simpledrm 2> /dev/null
-if [ -f /etc/modules ] ; then
+$MOCK modprobe -a $(echo "$KOPT_modules $rootfstype" | tr ',' ' ' ) loop squashfs simpledrm 2> /dev/null
+if [ -f "$ROOT"/etc/modules ] ; then
 	sed 's/\#.*//g' < /etc/modules |
 	while read module args; do
 		modprobe -q $module $args
@@ -499,18 +531,20 @@ if [ -n "$KOPT_nbd" ]; then
 fi
 
 # zpool reports /dev/zfs missing if it can't read /etc/mtab
-ln -s /proc/mounts /etc/mtab
+ln -s /proc/mounts "$ROOT"/etc/mtab
 
 # check if root=... was set
 if [ -n "$KOPT_root" ]; then
+	# run nlplug-findfs before SINGLEMODE so we load keyboard drivers
+	ebegin "Mounting root"
+	$MOCK nlplug-findfs $cryptopts -p /sbin/mdev ${KOPT_debug_init:+-d} \
+		${KOPT_uevent_buf_size:+-U $KOPT_uevent_buf_size} \
+		$KOPT_root
+
 	if [ "$SINGLEMODE" = "yes" ]; then
 		echo "Entering single mode. Type 'exit' to continue booting."
 		sh
 	fi
-
-	ebegin "Mounting root"
-	nlplug-findfs $cryptopts -p /sbin/mdev ${KOPT_debug_init:+-d} \
-		$KOPT_root
 
 	if echo "$KOPT_modules $rootfstype" | grep -qw btrfs; then
 		/sbin/btrfs device scan >/dev/null || \
@@ -536,21 +570,21 @@ if [ -n "$KOPT_root" ]; then
 			$sysroot/media/root-rw
 		# Mount read-only underlying rootfs
 		rootflags="${KOPT_rootflags:+$KOPT_rootflags,}ro"
-		mount ${KOPT_rootfstype:+-t $KOPT_rootfstype} -o $rootflags \
+		$MOCK mount ${KOPT_rootfstype:+-t $KOPT_rootfstype} -o $rootflags \
 			$KOPT_root /media/root-ro
 		# Mount writable overlay tmpfs
 		overlaytmpfsflags="mode=0755,${KOPT_overlaytmpfsflags:+$KOPT_overlaytmpfsflags,}rw"
-		mount -t tmpfs -o $overlaytmpfsflags root-tmpfs /media/root-rw
+		$MOCK mount -t tmpfs -o $overlaytmpfsflags root-tmpfs /media/root-rw
 		# Create additional mountpoints and do the overlay mount
 		mkdir -p /media/root-rw/work /media/root-rw/root
-		mount -t overlay -o \
+		$MOCK mount -t overlay -o \
 			lowerdir=/media/root-ro,upperdir=/media/root-rw/root,workdir=/media/root-rw/work \
 			overlayfs $sysroot
 	else
 		if [ "$rootfstype" = "zfs" ]; then
 			prepare_zfs_root
 		fi
-		mount ${rootfstype:+-t} ${rootfstype} \
+		$MOCK mount ${rootfstype:+-t} ${rootfstype} \
 			-o ${KOPT_rootflags:-ro} \
 			${KOPT_root#ZFS=} $sysroot
 	fi
@@ -560,18 +594,18 @@ if [ -n "$KOPT_root" ]; then
 	## add support for usr on seperate partition
 	if [ -f "${sysroot}/etc/fstab" ]; then
     	grep '/usr' "${sysroot}/etc/fstab" | while read dev mnt fs MNTOPTS chk; do
-        	 mount -t $fs -o $MNTOPTS $dev ${sysroot}$mnt 
+        	 mount -t $fs -o $MNTOPTS $dev $mnt 
     	done
 	fi
-	
-	cat /proc/mounts | while read DEV DIR TYPE OPTS ; do
+
+	cat "$ROOT"/proc/mounts 2>/dev/null | while read DEV DIR TYPE OPTS ; do
 		if [ "$DIR" != "/" -a "$DIR" != "$sysroot" -a -d "$DIR" ]; then
 			mkdir -p $sysroot/$DIR
-			mount -o move $DIR $sysroot/$DIR
+			$MOCK mount -o move $DIR $sysroot/$DIR
 		fi
 	done
-	sync
-	exec /bin/busybox switch_root $sysroot $chart_init "$KOPT_init" $KOPT_init_args
+	$MOCK sync
+	exec switch_root $switch_root_opts $sysroot $chart_init "$KOPT_init" $KOPT_init_args
 	echo "initramfs emergency recovery shell launched"
 	exec /bin/busybox sh
 fi
@@ -584,9 +618,10 @@ fi
 
 # locate boot media and mount it
 ebegin "Mounting boot media"
-nlplug-findfs $cryptopts -p /sbin/mdev ${KOPT_debug_init:+-d} \
+$MOCK nlplug-findfs $cryptopts -p /sbin/mdev ${KOPT_debug_init:+-d} \
 	${KOPT_usbdelay:+-t $(( $KOPT_usbdelay * 1000 ))} \
-	$repoopts -a /tmp/apkovls
+	${KOPT_uevent_buf_size:+-U $KOPT_uevent_buf_size} \
+	$repoopts -a "$ROOT"/tmp/apkovls
 eend $?
 
 # Setup network interfaces
@@ -610,20 +645,19 @@ if [ -n "$KOPT_rootflags" ]; then
 	rootflags="$rootflags,$KOPT_rootflags"
 fi
 
-mount -t tmpfs -o $rootflags tmpfs $sysroot
+$MOCK mount -t tmpfs -o $rootflags tmpfs $sysroot
 
 if [ -z "$KOPT_apkovl" ]; then
 	# Not manually set, use the apkovl found by nlplug
-	if [ -e /tmp/apkovls ]; then
-		ovl=$(head -n 1 /tmp/apkovls)
+	if [ -e "$ROOT"/tmp/apkovls ]; then
+		ovl=$(head -n 1 "$ROOT"/tmp/apkovls)
 	fi
 elif is_url "$KOPT_apkovl"; then
 	# Fetch apkovl via network
-	MACHINE_UUID=$(cat /sys/class/dmi/id/product_uuid 2>/dev/null)
-	url="${KOPT_apkovl/{MAC\}/$MAC_ADDRESS}"
-	url="${url/{UUID\}/$MACHINE_UUID}"
+	MACHINE_UUID=$(cat "$ROOT"/sys/class/dmi/id/product_uuid 2>/dev/null)
+	url="$(echo "$KOPT_apkovl" | sed -e "s/{MAC}/$MAC_ADDRESS/" -e "s/{UUID}/$MACHINE_UUID/")"
 	ovl=/tmp/${url##*/}
-	wget -O "$ovl" "$url" || ovl=
+	$MOCK wget -O "$ovl" "$url" || ovl=
 else
 	ovl="$KOPT_apkovl"
 fi
@@ -672,6 +706,14 @@ if [ -f "$sysroot/etc/.default_boot_services" -o ! -f "$ovl" ]; then
 		rc_add sshd default
 	fi
 
+	if findfs LABEL=cidata >/dev/null 2>&1 || findfs LABEL=CIDATA >/dev/null 2>&1; then
+		pkgs="$pkgs tiny-cloud-alpine ifupdown-ng"
+		rc_add tiny-cloud-boot boot
+		rc_add tiny-cloud-early default
+		rc_add tiny-cloud-main default
+		rc_add tiny-cloud-final default
+	fi
+
 	rm -f "$sysroot/etc/.default_boot_services"
 fi
 
@@ -711,14 +753,14 @@ if [ -f $sysroot/etc/fstab ]; then
 	# let user override tmpfs size in fstab in apkovl
 	mountopts=$(awk '$2 == "/" && $3 == "tmpfs" { print $4 }' $sysroot/etc/fstab)
 	if [ -n "$mountopts" ]; then
-		mount -o remount,$mountopts $sysroot
+		$MOCK mount -o remount,$mountopts $sysroot
 	fi
 	# move the ALPINE_MNT if ALPINE_DEV is specified in users fstab
 	# this is so a generated /etc/apk/repositories will use correct
 	# mount dir
-	relocate_mount "$sysroot"/etc/fstab
-elif [ -f /etc/fstab ]; then
-	relocate_mount /etc/fstab
+	remount_fstab_entry "$sysroot"/etc/fstab
+elif [ -f "$ROOT"/etc/fstab ]; then
+	remount_fstab_entry "$ROOT"/etc/fstab
 fi
 
 # hack so we get openrc
@@ -759,11 +801,16 @@ else
 fi
 
 # enable support for modloop verification
-if [ -f /var/cache/misc/*modloop*.SIGN.RSA.*.pub ]; then
+for _pubkey in "$ROOT"/var/cache/misc/*modloop*.SIGN.RSA.*.pub; do
+	# check only if the glob matched something
+	[ -f "$_pubkey" ] || continue
+
+	# then do it in one iteration anyway
 	mkdir -p "$sysroot"/var/cache/misc
-	cp /var/cache/misc/*modloop*.SIGN.RSA.*.pub "$sysroot"/var/cache/misc
+	cp "$ROOT"/var/cache/misc/*modloop*.SIGN.RSA.*.pub "$sysroot"/var/cache/misc
 	pkgs="$pkgs openssl"
-fi
+	break
+done
 
 apkflags="--initramfs-diskless-boot --progress"
 if [ -z "$MAC_ADDRESS" ]; then
@@ -781,25 +828,25 @@ if [ "$KOPT_keep_apk_new" != yes ]; then
 	[ -n "$ovlfiles" ] && apkflags="$apkflags --overlay-from-stdin"
 fi
 mkdir -p $sysroot/sys $sysroot/proc $sysroot/dev
-mount -o bind /sys $sysroot/sys
-mount -o bind /proc $sysroot/proc
-mount -o bind /dev $sysroot/dev
+$MOCK mount -o bind /sys $sysroot/sys
+$MOCK mount -o bind /proc $sysroot/proc
+$MOCK mount -o bind /dev $sysroot/dev
 if [ -n "$ovlfiles" ]; then
 	apk add --root $sysroot $repo_opt $apkflags $pkgs <$ovlfiles
 else
 	apk add --root $sysroot $repo_opt $apkflags $pkgs
 fi
-umount $sysroot/sys $sysroot/proc $sysroot/dev
+$MOCK umount $sysroot/sys $sysroot/proc $sysroot/dev
 eend $?
 
 # unmount ovl mount if needed
 if [ -n "$ovl_unmount" ]; then
-	umount $ovl_unmount 2>/dev/null
+	$MOCK umount $ovl_unmount 2>/dev/null
 fi
 
 # remount according default fstab from package
 if [ -z "$has_fstab" ] && [ -f "$sysroot"/etc/fstab ]; then
-	relocate_mount "$sysroot"/etc/fstab
+	remount_fstab_entry "$sysroot"/etc/fstab
 fi
 
 # generate repositories if none exists. this needs to be done after relocation
@@ -807,22 +854,8 @@ if ! [ -f "$sysroot"/etc/apk/repositories ]; then
 	find_boot_repositories > "$sysroot"/etc/apk/repositories
 fi
 
-# respect mount options in fstab for ALPINE_MNT (e.g if user wants rw)
-if [ -f "$sysroot"/etc/fstab ]; then
-	opts=$(awk "\$2 == \"$ALPINE_MNT\" {print \$4}" $sysroot/etc/fstab)
-	if [ -n "$opts" ]; then
-		mount -o remount,$opts "$ALPINE_MNT"
-	fi
-fi
-
 # fix inittab if alternative console
 setup_inittab_console
-
-# copy alpine release info
-#if ! [ -f "$sysroot"/etc/alpine-release ] && [ -f $ALPINE_MNT/.alpine-release ]; then
-#	cp $ALPINE_MNT/.alpine-release $sysroot/
-#	ln -sf /.alpine-release $sysroot/etc/alpine-release
-#fi
 
 ! [ -f "$sysroot"/etc/resolv.conf ] && [ -f /etc/resolv.conf ] && \
 	cp /etc/resolv.conf "$sysroot"/etc
@@ -842,17 +875,17 @@ if [ ! -x "${sysroot}${KOPT_init}" ]; then
 fi
 
 # switch over to new root
-cat /proc/mounts | while read DEV DIR TYPE OPTS ; do
+cat "$ROOT"/proc/mounts 2>/dev/null | while read DEV DIR TYPE OPTS ; do
 	if [ "$DIR" != "/" -a "$DIR" != "$sysroot" -a -d "$DIR" ]; then
 		mkdir -p $sysroot/$DIR
-		mount -o move $DIR $sysroot/$DIR
+		$MOCK mount -o move $DIR $sysroot/$DIR
 	fi
 done
 sync
 
 [ "$KOPT_splash" = "init" ] && echo exit > $sysroot/$splashfile
 echo ""
-exec /bin/busybox switch_root $sysroot $chart_init "$KOPT_init" $KOPT_init_args
+exec switch_root $switch_root_opts $sysroot $chart_init "$KOPT_init" $KOPT_init_args
 
 [ "$KOPT_splash" != "no" ] && echo exit > $sysroot/$splashfile
 echo "initramfs emergency recovery shell launched"
